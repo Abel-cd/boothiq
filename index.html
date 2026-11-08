@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="es" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BoothIQ — Spotting Board Inteligente</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body { background-color: #090d16; color: #f1f5f9; font-family: system-ui, -apple-system, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+
+    /* ESTILOS DE EXPORTACIÓN A PDF / IMPRESIÓN A4 HORIZONTAL DE 1 PÁGINA */
+    @media print {
+      @page { size: A4 landscape; margin: 6mm; }
+      body { background-color: #ffffff !important; color: #0f172a !important; font-size: 9pt; }
+      .no-print { display: none !important; }
+      .print-only { display: block !important; }
+      .print-grid { display: grid !important; grid-template-columns: 1fr 1fr !important; gap: 8px !important; }
+      .print-card {
+        background: #ffffff !important;
+        border: 1px solid #94a3b8 !important;
+        color: #0f172a !important;
+        padding: 4px 6px !important;
+        margin-bottom: 4px !important;
+        break-inside: avoid;
+      }
+      .print-card * { color: #0f172a !important; }
+      .print-badge {
+        background: #e2e8f0 !important;
+        border: 1px solid #64748b !important;
+        color: #0f172a !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    function BoothIQApp() {
+      const [homeInput, setHomeInput] = useState("Barcelona");
+      const [awayInput, setAwayInput] = useState("Atlético");
+      const [refInput, setRefInput] = useState("Jesús Gil Manzano");
+      const [venueInput, setVenueInput] = useState("Spotify Camp Nou");
+      const [loading, setLoading] = useState(false);
+
+      // Estado del Partido
+      const [matchData, setMatchData] = useState(null);
+      const [score, setScore] = useState({ home: 0, away: 0 });
+      const [minute, setMinute] = useState(1);
+      const [clockRunning, setClockRunning] = useState(false);
+      const [onlyApercibidos, setOnlyApercibidos] = useState(false);
+      const [showPanicModal, setShowPanicModal] = useState(false);
+      const [readStories, setReadStories] = useState({});
+      const [liveFeed, setLiveFeed] = useState([]);
+      const [subModalPlayer, setSubModalPlayer] = useState(null);
+
+      // Estado de Sincronización en Vivo (Auto-Live)
+      const [autoLive, setAutoLive] = useState(false);
+      const [fixtureId, setFixtureId] = useState("");
+      const [simStep, setSimStep] = useState(1);
+      const processedEventsRef = useRef(new Set());
+
+      useEffect(() => {
+        const saved = localStorage.getItem("boothiq_active_match");
+        if (saved) {
+          setMatchData(JSON.parse(saved));
+        } else {
+          fetchAutomatedMatch();
+        }
+      }, []);
+
+      // Cronómetro manual
+      useEffect(() => {
+        if (!clockRunning) return;
+        const timer = setInterval(() => {
+          setMinute((m) => (m < 99 ? m + 1 : m));
+        }, 60000);
+        return () => clearInterval(timer);
+      }, [clockRunning]);
+
+      // Motor de Polling Auto-Live (cada 8 segundos en modo test o 45s con Fixture ID)
+      useEffect(() => {
+        if (!autoLive || !matchData) return;
+        const intervalMs = fixtureId.trim() ? 45000 : 8000;
+
+        const pollTimer = setInterval(async () => {
+          try {
+            const res = await fetch(`/api/live-events?fixture_id=${encodeURIComponent(fixtureId)}&sim_step=${simStep}`);
+            const data = await res.json();
+            if (!data.events) return;
+
+            data.events.forEach((ev) => {
+              if (processedEventsRef.current.has(ev.event_id)) return;
+              processedEventsRef.current.add(ev.event_id);
+              setMinute(ev.minute);
+
+              if (data.source === "simulator") {
+                const teamKey = ev.side === "home" ? "home_team" : "away_team";
+                const starters = matchData[teamKey].filter((p) => p.is_starter);
+                const bench = matchData[teamKey].filter((p) => !p.is_starter);
+                const targetPlayer = starters[ev.starter_idx % starters.length];
+
+                if (ev.type === "GOAL" && targetPlayer) {
+                  triggerGoal(ev.side, targetPlayer, ev.minute, true);
+                } else if (ev.type === "YELLOW" && targetPlayer) {
+                  triggerYellow(targetPlayer, ev.minute, true);
+                } else if (ev.type === "SUB" && targetPlayer && bench.length > 0) {
+                  const subIn = bench[ev.bench_idx % bench.length];
+                  executeSubstitution(ev.side, targetPlayer, subIn, ev.minute, true);
+                }
+              } else {
+                // Mapeo por nombre desde API-Football real
+                const allHome = matchData.home_team;
+                const allAway = matchData.away_team;
+                const matchPlayer = [...allHome, ...allAway].find((p) =>
+                  p.name.toLowerCase().includes((ev.player_name || "").toLowerCase())
+                );
+                if (matchPlayer) {
+                  const side = allHome.some((h) => h.id === matchPlayer.id) ? "home" : "away";
+                  if (ev.type === "GOAL") triggerGoal(side, matchPlayer, ev.minute, true);
+                  if (ev.type === "YELLOW") triggerYellow(matchPlayer, ev.minute, true);
+                }
+              }
+            });
+
+            if (!fixtureId.trim()) {
+              setSimStep((s) => (s < 5 ? s + 1 : s));
+            }
+          } catch (e) {
+            console.error("Error en Auto-Live polling:", e);
+          }
+        }, intervalMs);
+
+        return () => clearInterval(pollTimer);
+      }, [autoLive, fixtureId, simStep, matchData]);
+
+      const saveState = (newData) => {
+        setMatchData(newData);
+        localStorage.setItem("boothiq_active_match", JSON.stringify(newData));
+      };
+
+      const fetchAutomatedMatch = async () => {
+        setLoading(true);
+        try {
+          const url = `/api/generate-match?home=${encodeURIComponent(homeInput)}&away=${encodeURIComponent(awayInput)}&referee=${encodeURIComponent(refInput)}&venue=${encodeURIComponent(venueInput)}`;
+          const res = await fetch(url);
+          const data = await res.json();
+          saveState(data);
+          setScore({ home: 0, away: 0 });
+          setMinute(1);
+          setSimStep(1);
+          processedEventsRef.current.clear();
+          setLiveFeed([{
+            id: Date.now(),
+            min: 1,
+            type: "INFO",
+            title: "Pizarra generada y lista",
+            text: `Plantillas de ${data.home_name} y ${data.away_name} cargadas. Activa '📡 Auto-Live' arriba para recibir eventos automáticamente o usa los botones ⚽, 🟨 y 🔄.`
+          }]);
+        } catch (err) {
+          alert("Error conectando con server.py.");
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const triggerGoal = (side, player, customMin = minute, isAuto = false) => {
+        setScore((prev) => ({ ...prev, [side]: prev[side] + 1 }));
+        setLiveFeed((prev) => [
+          {
+            id: Date.now() + Math.random(),
+            min: customMin,
+            type: "GOAL",
+            title: `${isAuto ? "⚡ [AUTO-LIVE] " : ""}GOL DE ${player.name.toUpperCase()} (#${player.number})`,
+            text: player.triggers.on_goal
+          },
+          ...prev
+        ]);
+      };
+
+      const triggerYellow = (player, customMin = minute, isAuto = false) => {
+        setLiveFeed((prev) => [
+          {
+            id: Date.now() + Math.random(),
+            min: customMin,
+            type: player.is_apercibido ? "ALERT" : "YELLOW",
+            title: `${isAuto ? "⚡ [AUTO-LIVE] " : ""}AMARILLA A ${player.name.toUpperCase()} (#${player.number})`,
+            text: player.triggers.on_yellow
+          },
+          ...prev
+        ]);
+      };
+
+      const executeSubstitution = (side, starter, subIn, customMin = minute, isAuto = false) => {
+        const teamKey = side === "home" ? "home_team" : "away_team";
+        setMatchData((prevData) => {
+          const updatedTeam = prevData[teamKey].map((p) => {
+            if (p.id === starter.id) return { ...p, is_starter: false };
+            if (p.id === subIn.id) return { ...p, is_starter: true };
+            return p;
+          });
+          const nextState = { ...prevData, [teamKey]: updatedTeam };
+          localStorage.setItem("boothiq_active_match", JSON.stringify(nextState));
+          return nextState;
+        });
+
+        setLiveFeed((prev) => [
+          {
+            id: Date.now() + Math.random(),
+            min: customMin,
+            type: "SUB",
+            title: `${isAuto ? "⚡ [AUTO-LIVE] " : ""}CAMBIO: Entra #${subIn.number} ${subIn.name} por #${starter.number} ${starter.name}`,
+            text: subIn.triggers.on_sub_in || `🔄 Se incorpora ${subIn.name} al terreno de juego.`
+          },
+          ...prev
+        ]);
+        setSubModalPlayer(null);
+      };
+
+      const editBulletInline = (side, playerId, bulletIdx) => {
+        const teamKey = side === "home" ? "home_team" : "away_team";
+        const player = matchData[teamKey].find((p) => p.id === playerId);
+        const nuevoTexto = prompt("Editar nota rápida de cabina:", player.bullets[bulletIdx]);
+        if (nuevoTexto !== null && nuevoTexto.trim() !== "") {
+          const updatedTeam = matchData[teamKey].map((p) => {
+            if (p.id !== playerId) return p;
+            const newBullets = [...p.bullets];
+            newBullets[bulletIdx] = nuevoTexto;
+            return { ...p, bullets: newBullets };
+          });
+          saveState({ ...matchData, [teamKey]: updatedTeam });
+        }
+      };
+
+      if (!matchData) {
+        return (
+          <div className="min-h-screen flex items-center justify-center text-slate-300">
+            <div className="text-xl font-bold animate-pulse text-emerald-400">⚡ Preparando Cabina BoothIQ...</div>
+          </div>
+        );
+      }
+
+      const renderTeamColumn = (side, teamName, roster, accentClass) => {
+        const starters = roster.filter((p) => p.is_starter && (!onlyApercibidos || p.is_apercibido));
+        const bench = roster.filter((p) => !p.is_starter);
+
+        return (
+          <div className="space-y-2">
+            <div className={`px-3 py-2 rounded-lg bg-slate-900 border-l-4 ${accentClass} flex justify-between items-center print-card`}>
+              <span className="font-bold tracking-wide uppercase text-sm">{teamName} (11 Titular)</span>
+              <span className="text-xs text-slate-400">Próx: {side === "home" ? matchData.next_opponent_home : matchData.next_opponent_away}</span>
+            </div>
+
+            <div className="space-y-1.5">
+              {starters.map((p) => (
+                <div
+                  key={p.id}
+                  className={`p-2 rounded-lg border transition print-card ${
+                    p.is_apercibido
+                      ? "bg-amber-950/20 border-amber-500/50"
+                      : "bg-slate-900/90 border-slate-800 hover:border-slate-700"
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="w-7 h-7 rounded bg-slate-800 text-white font-black text-sm flex items-center justify-center border border-slate-700 print-badge">
+                        {p.number}
+                      </span>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-bold text-sm text-white">{p.name}</span>
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-semibold print-badge">{p.pos}</span>
+                        <span className="text-[11px] text-slate-400">{p.age}a</span>
+                        {p.is_apercibido && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-bold print-badge">
+                            ⚠️ APERCIBIDO
+                          </span>
+                        )}
+                        {p.is_hot_streak && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold print-badge">
+                            🔥 RACHA
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-1 no-print">
+                      <button
+                        onClick={() => triggerGoal(side, p)}
+                        className="px-2 py-1 text-xs rounded bg-emerald-600/20 hover:bg-emerald-600/40 border border-emerald-500/40 text-emerald-200 font-semibold"
+                      >
+                        ⚽
+                      </button>
+                      <button
+                        onClick={() => triggerYellow(p)}
+                        className="px-2 py-1 text-xs rounded bg-amber-500/20 hover:bg-amber-500/40 border border-amber-500/40 text-amber-200 font-semibold"
+                      >
+                        🟨
+                      </button>
+                      <button
+                        onClick={() => setSubModalPlayer({ side, starter: p, bench })}
+                        className="px-2 py-1 text-xs rounded bg-sky-500/20 hover:bg-sky-500/40 border border-sky-500/40 text-sky-200 font-semibold"
+                      >
+                        🔄
+                      </button>
+                    </div>
+                  </div>
+
+                  <ul className="mt-1.5 space-y-0.5 text-xs text-slate-300 pl-1">
+                    {p.bullets.map((b, idx) => (
+                      <li
+                        key={idx}
+                        onClick={() => editBulletInline(side, p.id, idx)}
+                        className="cursor-pointer hover:text-emerald-300 transition flex items-start gap-1.5"
+                      >
+                        <span className="text-slate-500">•</span>
+                        <span>{b}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+
+            <div className="p-2 rounded-lg bg-slate-900/60 border border-slate-800 print-card">
+              <div className="text-[11px] font-bold uppercase text-slate-400 mb-1.5">Banquillo / Revulsivos ({bench.length})</div>
+              <div className="flex flex-wrap gap-1">
+                {bench.map((b) => (
+                  <span key={b.id} className="text-[11px] px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-300 print-badge">
+                    <strong>#{b.number}</strong> {b.name} ({b.pos})
+                  </span>
+                ))}
+              </div>
+            </div>
+          </div>
+        );
+      };
+
+      return (
+        <div className="min-h-screen flex flex-col">
+          {/* CABECERA EXCLUSIVA PARA EL PDF IMPRESO */}
+          <div className="hidden print-only mb-2 pb-1 border-b-2 border-black">
+            <div className="flex justify-between items-center">
+              <h1 className="text-base font-black uppercase">
+                📋 Spotting Board Oficial: {matchData.home_name} vs {matchData.away_name} ({matchData.competition})
+              </h1>
+              <span className="text-xs font-semibold">
+                Estadio: {matchData.venue} | Árbitro: {matchData.referee}
+              </span>
+            </div>
+          </div>
+
+          {/* BARRA SUPERIOR INTERACTIVA (Oculta al exportar PDF) */}
+          <header className="bg-slate-900 border-b border-slate-800 px-3 py-2 sticky top-0 z-20 no-print">
+            <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="font-black text-sm tracking-tight text-emerald-400 mr-1">🎙️ BoothIQ</span>
+                <input
+                  value={homeInput}
+                  onChange={(e) => setHomeInput(e.target.value)}
+                  className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs w-24 text-white"
+                />
+                <span className="text-xs text-slate-500 font-bold">vs</span>
+                <input
+                  value={awayInput}
+                  onChange={(e) => setAwayInput(e.target.value)}
+                  className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs w-24 text-white"
+                />
+                <input
+                  value={refInput}
+                  onChange={(e) => setRefInput(e.target.value)}
+                  className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs w-32 text-slate-300"
+                />
+                <button
+                  onClick={fetchAutomatedMatch}
+                  disabled={loading}
+                  className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-2.5 py-1 rounded transition"
+                >
+                  {loading ? "⏳..." : "⚡ Generar"}
+                </button>
+              </div>
+
+              {/* Control Auto-Live en Tiempo Real */}
+              <div className="flex items-center gap-1.5 bg-slate-950 px-2.5 py-1 rounded-lg border border-slate-800">
+                <input
+                  value={fixtureId}
+                  onChange={(e) => setFixtureId(e.target.value)}
+                  placeholder="Fixture ID (opc.)"
+                  title="ID del partido en API-Football (déjalo vacío para usar el Simulador en Vivo)"
+                  className="bg-slate-900 border border-slate-700 rounded px-2 py-0.5 text-[11px] w-24 text-slate-300"
+                />
+                <button
+                  onClick={() => setAutoLive(!autoLive)}
+                  className={`text-xs font-bold px-2.5 py-1 rounded transition flex items-center gap-1 ${
+                    autoLive
+                      ? "bg-rose-600 text-white animate-pulse"
+                      : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                  }`}
+                >
+                  📡 {autoLive ? "Auto-Live ON" : "Auto-Live OFF"}
+                </button>
+              </div>
+
+              {/* Marcador y Reloj */}
+              <div className="flex items-center gap-2 bg-slate-950 px-3 py-1 rounded-lg border border-slate-800">
+                <span className="font-bold text-xs">{matchData.home_name}</span>
+                <span className="text-base font-black text-emerald-400">
+                  {score.home} - {score.away}
+                </span>
+                <span className="font-bold text-xs">{matchData.away_name}</span>
+                <button
+                  onClick={() => setClockRunning(!clockRunning)}
+                  className="text-xs font-mono font-bold px-2 py-0.5 rounded bg-slate-800 text-slate-300"
+                >
+                  ⏱️ {minute}' {clockRunning ? "⏸" : "▶"}
+                </button>
+              </div>
+
+              {/* Botones de Acción: Filtro, PDF y Pánico VAR */}
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => setOnlyApercibidos(!onlyApercibidos)}
+                  className={`text-xs font-semibold px-2 py-1 rounded border ${
+                    onlyApercibidos
+                      ? "bg-amber-500/20 border-amber-500 text-amber-300"
+                      : "bg-slate-800 border-slate-700 text-slate-300"
+                  }`}
+                >
+                  ⚠️ Apercibidos
+                </button>
+                <button
+                  onClick={() => window.print()}
+                  className="bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs px-2.5 py-1 rounded transition"
+                  title="Exportar Spotting Board en PDF A4 Horizontal"
+                >
+                  🖨️ PDF Cabina
+                </button>
+                <button
+                  onClick={() => setShowPanicModal(true)}
+                  className="bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs px-2.5 py-1 rounded transition"
+                >
+                  🚨 VAR / Parón
+                </button>
+              </div>
+            </div>
+          </header>
+
+          {/* GRID PRINCIPAL */}
+          <main className="max-w-[1600px] w-full mx-auto p-3 grid grid-cols-1 lg:grid-cols-12 gap-3 flex-1 print-grid">
+            <div className="lg:col-span-4">
+              {renderTeamColumn("home", matchData.home_name, matchData.home_team, "border-sky-500")}
+            </div>
+
+            <div className="lg:col-span-4">
+              {renderTeamColumn("away", matchData.away_name, matchData.away_team, "border-rose-500")}
+            </div>
+
+            <div className="lg:col-span-4 flex flex-col no-print">
+              <div className="bg-slate-900 border border-slate-800 rounded-lg p-3 sticky top-14 space-y-2.5">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                  <div>
+                    <h2 className="font-bold text-sm text-emerald-400 uppercase tracking-wider">
+                      🎙️ Teleprompter en Vivo
+                    </h2>
+                    <p className="text-[11px] text-slate-400">
+                      {autoLive ? "📡 Escuchando eventos del partido automáticamente..." : "Modo manual a 1 clic activo"}
+                    </p>
+                  </div>
+                  <button onClick={() => setLiveFeed([])} className="text-[11px] text-slate-400 hover:text-white">
+                    Limpiar
+                  </button>
+                </div>
+
+                <div className="space-y-2 max-h-[75vh] overflow-y-auto pr-1">
+                  {liveFeed.map((item) => (
+                    <div
+                      key={item.id}
+                      className={`p-3 rounded-lg border-l-4 ${
+                        item.type === "GOAL"
+                          ? "bg-emerald-950/30 border-emerald-400"
+                          : item.type === "ALERT"
+                          ? "bg-rose-950/40 border-rose-500"
+                          : item.type === "SUB"
+                          ? "bg-sky-950/30 border-sky-400"
+                          : "bg-slate-800/80 border-amber-400"
+                      }`}
+                    >
+                      <div className="flex justify-between items-center text-[11px] text-slate-400 mb-1">
+                        <span className="font-bold text-white">{item.title}</span>
+                        <span className="font-mono">Min {item.min}'</span>
+                      </div>
+                      <p className="text-sm text-slate-100 leading-relaxed font-medium">{item.text}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </main>
+
+          {/* SECCIÓN INFERIOR DE HISTORIAS VAR PARA EL PDF IMPRESO */}
+          <section className="hidden print-only mt-2 pt-2 border-t border-slate-400">
+            <div className="text-xs font-black uppercase mb-1">🚨 Guiones Rápidos de Tiempo Muerto / VAR:</div>
+            <div className="grid grid-cols-4 gap-2">
+              {matchData.var_panic_stories.map((st) => (
+                <div key={st.id} className="print-card text-[8pt]">
+                  <strong>{st.category}:</strong> {st.script}
+                </div>
+              ))}
+            </div>
+          </section>
+
+          {/* MODAL DE SUSTITUCIÓN */}
+          {subModalPlayer && (
+            <div className="fixed inset-0 bg-black/75 flex items-center justify-center z-50 p-4 no-print">
+              <div className="bg-slate-900 border border-slate-700 rounded-xl max-w-md w-full p-4 space-y-3">
+                <div className="flex justify-between items-center">
+                  <h3 className="font-bold text-sm text-white">
+                    🔄 Sustituir a #{subModalPlayer.starter.number} {subModalPlayer.starter.name}
+                  </h3>
+                  <button onClick={() => setSubModalPlayer(null)} className="text-slate-400 hover:text-white">✕</button>
+                </div>
+                <div className="space-y-1.5 max-h-64 overflow-y-auto">
+                  {subModalPlayer.bench.map((sub) => (
+                    <button
+                      key={sub.id}
+                      onClick={() => executeSubstitution(subModalPlayer.side, subModalPlayer.starter, sub)}
+                      className="w-full text-left p-2.5 rounded bg-slate-800 hover:bg-sky-900/40 border border-slate-700 flex justify-between items-center"
+                    >
+                      <span>
+                        <strong className="text-sky-400 mr-2">#{sub.number}</strong>
+                        <span className="font-semibold text-sm text-white">{sub.name}</span>
+                        <span className="text-xs text-slate-400 ml-2">({sub.pos})</span>
+                      </span>
+                      <span className="text-xs text-emerald-400 font-bold">Entra →</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* MODAL DE PÁNICO VAR */}
+          {showPanicModal && (
+            <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 no-print">
+              <div className="bg-slate-900 border border-rose-500/50 rounded-xl max-w-2xl w-full p-5 space-y-4">
+                <div className="flex justify-between items-center border-b border-slate-800 pb-3">
+                  <h3 className="font-black text-base text-rose-400 uppercase">
+                    🚨 Guiones de Salvavidas (Parón de VAR / Lesión)
+                  </h3>
+                  <button
+                    onClick={() => setShowPanicModal(false)}
+                    className="px-3 py-1 rounded bg-slate-800 text-slate-300 hover:text-white text-xs font-bold"
+                  >
+                    Cerrar
+                  </button>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {matchData.var_panic_stories.map((st) => {
+                    const isRead = !!readStories[st.id];
+                    return (
+                      <div
+                        key={st.id}
+                        className={`p-3.5 rounded-lg border ${
+                          isRead ? "bg-slate-950 border-slate-800 opacity-50" : "bg-slate-800/70 border-slate-700"
+                        }`}
+                      >
+                        <div className="flex justify-between items-center text-[11px] mb-1">
+                          <span className="font-bold text-rose-300 uppercase">{st.category}</span>
+                          <span className="text-slate-400">⏱️ {st.reading_time}</span>
+                        </div>
+                        <h4 className="font-bold text-sm text-white mb-1.5">{st.title}</h4>
+                        <p className="text-xs text-slate-200 leading-relaxed mb-3">"{st.script}"</p>
+                        <button
+                          onClick={() => setReadStories({ ...readStories, [st.id]: !isRead })}
+                          className="text-[11px] px-2.5 py-1 rounded bg-slate-900 border border-slate-700 text-slate-300"
+                        >
+                          {isRead ? "↩ Desmarcar" : "✓ Marcar como locutado"}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<BoothIQApp />);
+  </script>
+</body>
+</html>
